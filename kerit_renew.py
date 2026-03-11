@@ -22,9 +22,14 @@ MASKED_EMAIL   = "******@" + KERIT_EMAIL.split("@")[1]
 LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
-_tg = os.environ["TG_BOT"].split(",")
-TG_CHAT_ID = _tg[0].strip()
-TG_TOKEN   = _tg[1].strip()
+_tg_raw = os.environ.get("TG_BOT", "")
+if _tg_raw and "," in _tg_raw:
+    _tg = _tg_raw.split(",")
+    TG_CHAT_ID = _tg[0].strip()
+    TG_TOKEN   = _tg[1].strip()
+else:
+    TG_CHAT_ID = ""
+    TG_TOKEN   = ""
 
 
 # ============================================================
@@ -46,6 +51,9 @@ def send_tg(result, server_id=None, remaining=None):
     if remaining is not None:
         lines.append(f"⏱️ 剩余时间: {remaining}天")
     msg = "\n".join(lines)
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("⚠️ TG未配置，跳过推送")
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": TG_CHAT_ID,
@@ -421,6 +429,26 @@ def solve_turnstile(sb) -> bool:
     return False
 
 
+def extract_remaining_days(sb) -> int:
+    """从 TIME REMAINING 卡片读取剩余天数"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var els = Array.from(document.querySelectorAll('*'));
+                for (var i = 0; i < els.length; i++) {
+                    var text = els[i].innerText || '';
+                    var m = text.match(/^(\d+)\s*Days?$/i);
+                    if (m && els[i].children.length === 0) {
+                        return parseInt(m[1]);
+                    }
+                }
+                return 0;
+            })()
+        """) or 0
+    except Exception:
+        return 0
+
+
 # ============================================================
 # 续期流程
 # ============================================================
@@ -435,32 +463,75 @@ def do_renew(sb):
         "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
     )
     if not server_id:
+        # 备选：从页面 Identifier 字段读取
+        server_id = sb.execute_script("""
+            (function(){
+                var els = Array.from(document.querySelectorAll('td, dd, span, div'));
+                for (var i = 0; i < els.length; i++) {
+                    var text = (els[i].innerText || '').trim();
+                    if (/^\d{6,}$/.test(text)) return text;
+                }
+                return null;
+            })()
+        """)
+    if not server_id:
         print("❌ serverData.id缺失")
         sb.save_screenshot("no_server_id.png")
         send_tg("❌ serverData.id缺失，续期失败")
         return
+    print(f"🆔 服务器ID: {server_id}")
 
-    for attempt in range(7):
+    initial_count = sb.execute_script("""
+        (function(){
+            var el = document.getElementById('renewal-count');
+            return el ? parseInt(el.innerText || "0") : 0;
+        })()
+    """)
+    need = 7 - initial_count
+    print(f"📊 当前进度: {initial_count}/7，本次需续期: {need}次")
+
+    if need <= 0:
+        print("🎉 已达上限7/7，无需续期")
+        sb.save_screenshot("renew_full.png")
+        remaining = extract_remaining_days(sb)
+        send_tg("✅ 无需续期（已达上限 7/7）", server_id, remaining)
+        return
+
+    for attempt in range(need):
         count = sb.execute_script("""
             (function(){
                 var el = document.getElementById('renewal-count');
                 return el ? parseInt(el.innerText || "0") : 0;
             })()
         """)
-        print(f"📊 续期进度: {count}/7")
+        remaining = extract_remaining_days(sb)
+        print(f"📊 续期进度: {count}/7  ⏱️ 剩余: {remaining}天")
 
         if count >= 7:
-            print("🎉 已达上限7/7")
+            print("🎉 已达上限7/7，提前结束")
             sb.save_screenshot("renew_full.png")
-            send_tg("✅ 续期完成", server_id, count)
+            send_tg("✅ 续期完成", server_id, remaining)
             return
 
-        print(f"🔁 第{attempt + 1}次续期...")
-        try:
-            sb.wait_for_element_visible('#renewServerBtn', timeout=10)
-            sb.click('#renewServerBtn')
-        except Exception as e:
-            print(f"❌ 续期按钮缺失：{e}")
+        print(f"🔁 第{attempt + 1}/{need}次续期...")
+
+        # 点击 Renew Server 按钮
+        renew_clicked = False
+        for _ in range(10):
+            try:
+                btns = sb.find_elements("a, button")
+                btn = next((b for b in btns if "Renew Server" in (b.text or "")), None)
+                if btn:
+                    btn.click()
+                    renew_clicked = True
+                    print("✅ 已点击「Renew Server」")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not renew_clicked:
+            print("❌ 续期按钮缺失")
             sb.save_screenshot("no_renew_btn.png")
             send_tg(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
             return
@@ -478,6 +549,22 @@ def do_renew(sb):
             sb.save_screenshot(f"no_turnstile_{attempt}.png")
             send_tg(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
             return
+
+        # 清空上一次的 token，避免复用（同时清空 input 字段）
+        try:
+            sb.execute_script("""
+                window.__cf_turnstile_token__ = '';
+                var inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    try {
+                        var nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        nativeSet.call(inputs[i], '');
+                        inputs[i].dispatchEvent(new Event('input', {bubbles: true}));
+                    } catch(e) { inputs[i].value = ''; }
+                }
+            """)
+        except Exception:
+            pass
 
         if not solve_turnstile(sb):
             sb.save_screenshot(f"turnstile_fail_{attempt}.png")
@@ -505,6 +592,22 @@ def do_renew(sb):
         """)
         print(f"📋 续期结果: {result}")
 
+        # 清空 token 防止下次复用（同时清空 input 字段）
+        try:
+            sb.execute_script("""
+                window.__cf_turnstile_token__ = '';
+                var inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    try {
+                        var nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        nativeSet.call(inputs[i], '');
+                        inputs[i].dispatchEvent(new Event('input', {bubbles: true}));
+                    } catch(e) { inputs[i].value = ''; }
+                }
+            """)
+        except Exception:
+            pass
+
         try:
             sb.execute_script("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
         except Exception:
@@ -515,14 +618,20 @@ def do_renew(sb):
         time.sleep(3)
 
     sb.save_screenshot("renew_done.png")
-    print("✅ 续期完成")
     final_count = sb.execute_script("""
         (function(){
             var el = document.getElementById('renewal-count');
             return el ? parseInt(el.innerText || "0") : 0;
         })()
     """)
-    send_tg("✅ 续期完成", server_id, final_count)
+    final_remaining = extract_remaining_days(sb)
+    print(f"📊 最终进度: {final_count}/7  ⏱️ 剩余: {final_remaining}天")
+    if final_count >= 7:
+        print("🎉 已达上限7/7")
+        send_tg("✅ 续期完成（7/7）", server_id, final_remaining)
+    else:
+        print(f"⚠️ 续期未达上限，当前{final_count}/7")
+        send_tg(f"⚠️ 续期未达上限（{final_count}/7）", server_id, final_remaining)
 
 
 # ============================================================
